@@ -3,12 +3,13 @@ import getpass
 import os
 import time
 from pathlib import Path
+import io
 
 def upload_via_jump_server_continuous():
-    """Continuous SFTP upload program - only exits on successful upload or user choice"""
+    """Continuous SFTP upload program with automatic dos2unix conversion"""
     
     print("=== CONTINUOUS SFTP UPLOAD VIA JUMP SERVER ===")
-    print("This program will only exit when upload succeeds or you choose to exit.\n")
+    print("This program automatically converts text files from DOS to Unix line endings.\n")
     
     connection_cache = {
         'jump_password': None,
@@ -16,17 +17,66 @@ def upload_via_jump_server_continuous():
         'jump_ssh': None,
         'target_ssh': None,
         'sftp': None,
-        'connected': False
+        'connected': False,
+        'text_extensions': {'.txt', '.sh', '.py', '.pl', '.conf', '.cfg', '.ini', '.log', 
+                          '.xml', '.json', '.yaml', '.yml', '.properties', '.sql', '.js', 
+                          '.css', '.html', '.htm', '.md', '.csv', '.tsv', '.bat', '.ps1'}
     }
+    
+    def is_text_file(file_path):
+        """Check if file should be converted based on extension"""
+        return file_path.suffix.lower() in connection_cache['text_extensions']
+    
+    def is_binary_file(file_path):
+        """Quick binary file detection to avoid converting binary files"""
+        try:
+            with open(file_path, 'rb') as f:
+                chunk = f.read(1024)
+                return b'\0' in chunk
+        except:
+            return False
+    
+    def convert_dos2unix_stream(local_file_path):
+        """Convert DOS line endings to Unix during upload"""
+        try:
+            print(f"    → Converting DOS to Unix line endings...")
+            with open(local_file_path, 'rb') as f:
+                content = f.read()
+            try:
+                text_content = content.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    text_content = content.decode('latin-1')
+                    print(f"      (using latin-1 encoding)")
+                except UnicodeDecodeError:
+                    print(f"      (cannot decode - uploading as binary)")
+                    return None
+            
+            original_lines = text_content.count('\r\n')
+            unix_content = text_content.replace('\r\n', '\n')
+            
+            unix_bytes = unix_content.encode('utf-8')
+            unix_file_obj = io.BytesIO(unix_bytes)
+            
+            if original_lines > 0:
+                print(f"      ✓ Converted {original_lines} DOS line endings")
+            else:
+                print(f"      → Already Unix format")
+            
+            return unix_file_obj
+            
+        except Exception as e:
+            print(f"      ✗ Conversion failed: {e}")
+            return None
     
     def get_connection_details():
         """Get connection details from user"""
         while True:
             try:
                 print("=== CONNECTION SETUP ===")
-
+                
                 jump_host = input("Jump server hostname (default: sshgateway): ").strip() or "sshgateway"
-                jump_user = input("Jump server username (corpdID)").strip()
+                jump_user = input("Jump server username (corpID): ").strip()
                 target_host = input("Target VM hostname (default: cmspqlvmctst11j): ").strip() or "cmspqlvmctst11j"
                 target_user = input("Target VM username (default: cmscorpadm): ").strip() or "cmscorpadm"
                 
@@ -82,7 +132,6 @@ def upload_via_jump_server_continuous():
                 print("✓ SFTP session established")
                 connected = True
                 
-                # Store connections in cache
                 connection_cache.update({
                     'jump_ssh': jump_ssh,
                     'target_ssh': target_ssh,
@@ -97,7 +146,6 @@ def upload_via_jump_server_continuous():
                 print("Clearing stored passwords...")
                 connection_cache['jump_password'] = None
                 connection_cache['target_password'] = None
-                retry_count += 1
                 if not connected:
                     print(f"Retrying authentication...")
                     time.sleep(2)
@@ -150,13 +198,17 @@ def upload_via_jump_server_continuous():
                 default_path = r""
                 
                 try:
-                    user_input = input(f"Enter local path (default: {default_path}): ").strip()
+                    user_input = input(f"Enter local path: ").strip()
                 except KeyboardInterrupt:
                     print("\nInput interrupted. Trying again...")
                     continue
                 
                 if not user_input:
-                    local_path = Path(default_path)
+                    if default_path:
+                        local_path = Path(default_path)
+                    else:
+                        print("Please enter a local path.")
+                        continue
                 else:
                     local_path = Path(user_input)
                 
@@ -282,7 +334,7 @@ def upload_via_jump_server_continuous():
                 continue
     
     def perform_upload(local_path, target_base_path):
-        """Perform the actual upload - return True only on complete success"""
+        """Perform upload with automatic dos2unix conversion"""
         try:
             sftp = connection_cache['sftp']
             target_dir = f"{target_base_path}/{local_path.name}"
@@ -301,6 +353,7 @@ def upload_via_jump_server_continuous():
             def upload_recursive(local_dir, remote_dir):
                 uploaded_count = 0
                 failed_count = 0
+                converted_count = 0
                 
                 try:
                     for item in local_dir.iterdir():
@@ -310,8 +363,26 @@ def upload_via_jump_server_continuous():
                             
                             if item.is_file():
                                 print(f"Uploading: {item.name}")
-                                sftp.put(str(local_item), remote_item)
-                                print(f"✓ Uploaded: {item.name}")
+                            
+                                should_convert = is_text_file(item) and not is_binary_file(item)
+                                
+                                if should_convert:
+                                    print(f"  → Text file detected, applying dos2unix conversion")
+                                    converted_file = convert_dos2unix_stream(local_item)
+                                    
+                                    if converted_file:
+                                        sftp.putfo(converted_file, remote_item)
+                                        converted_file.close()
+                                        print(f"  ✓ Uploaded with conversion: {item.name}")
+                                        converted_count += 1
+                                    else:
+                                        print(f"  → Conversion failed, uploading original file")
+                                        sftp.put(str(local_item), remote_item)
+                                        print(f"  ✓ Uploaded (original): {item.name}")
+                                else:
+                                    sftp.put(str(local_item), remote_item)
+                                    print(f"  ✓ Uploaded: {item.name}")
+                                
                                 uploaded_count += 1
                                 
                             elif item.is_dir():
@@ -324,9 +395,10 @@ def upload_via_jump_server_continuous():
                                         failed_count += 1
                                         continue
                                 
-                                sub_uploaded, sub_failed = upload_recursive(local_item, remote_item)
+                                sub_uploaded, sub_failed, sub_converted = upload_recursive(local_item, remote_item)
                                 uploaded_count += sub_uploaded
                                 failed_count += sub_failed
+                                converted_count += sub_converted
                                 
                         except Exception as e:
                             print(f"✗ Failed to process {item.name}: {e}")
@@ -336,22 +408,25 @@ def upload_via_jump_server_continuous():
                     print(f"✗ Error during directory traversal: {e}")
                     failed_count += 1
                 
-                return uploaded_count, failed_count
+                return uploaded_count, failed_count, converted_count
             
-            print(f"Starting upload...")
-            uploaded, failed = upload_recursive(local_path, target_dir)
+            print(f"Starting upload with automatic dos2unix conversion...")
+            uploaded, failed, converted = upload_recursive(local_path, target_dir)
             
             print(f"\n=== UPLOAD SUMMARY ===")
             print(f"✓ Successfully uploaded: {uploaded} files")
+            if converted > 0:
+                print(f"Files converted (dos2unix): {converted}")
+            else:
+                print(f"No text files required conversion")
             if failed > 0:
                 print(f"✗ Failed uploads: {failed} files")
                 print(f"Upload completed with errors.")
-                return False 
+                return False
             else:
                 print(f"All files uploaded successfully!")
             
             print(f"Target location: {target_dir}")
-            
 
             try:
                 target_ssh = connection_cache['target_ssh']
@@ -359,15 +434,26 @@ def upload_via_jump_server_continuous():
                 verification = stdout.read().decode()
                 print(f"\nFirst few files in target directory:")
                 print(verification)
+
+                if converted > 0:
+                    print(f"\nVerifying line endings conversion...")
+                    text_exts = "*.txt -o -name *.sh -o -name *.py -o -name *.conf -o -name *.log"
+                    stdin, stdout, stderr = target_ssh.exec_command(f'find "{target_dir}" -type f \\( -name {text_exts} \\) | head -3 | xargs file 2>/dev/null || echo "No text files found for verification"')
+                    file_check = stdout.read().decode()
+                    if file_check.strip():
+                        print("File type verification (should show 'text' without 'CRLF'):")
+                        print(file_check)
+                        
             except Exception as e:
                 print(f"Note: Could not verify upload: {e}")
             
-            return failed == 0 
+            return failed == 0
             
         except Exception as e:
             print(f"✗ Upload failed completely: {e}")
             return False
     
+
     while True:
         try:
             print(f"\n{'='*50}")
@@ -387,7 +473,7 @@ def upload_via_jump_server_continuous():
                 jump_user = connection_cache['jump_user']
                 target_host = connection_cache['target_host'] 
                 target_user = connection_cache['target_user']
-            
+
             while not connection_cache['connected']:
                 print("Establishing connection...")
                 
@@ -396,7 +482,7 @@ def upload_via_jump_server_continuous():
                 else:
                     print(f"Connection failed. Waiting 5 seconds before retry...")
                     time.sleep(5)
-            
+
             try:
                 connection_cache['target_ssh'].exec_command('echo "Connection test"')
                 print("✓ Connection is healthy")
@@ -404,15 +490,13 @@ def upload_via_jump_server_continuous():
                 print("Connection lost. Reconnecting...")
                 safe_disconnect()
                 continue
-            
+
             local_path = get_local_path()
-            
             target_path = get_target_path()
-            
             upload_success = perform_upload(local_path, target_path)
             
             if upload_success:
-                print(f"\n UPLOAD COMPLETED SUCCESSFULLY!")
+                print(f"\nUPLOAD COMPLETED SUCCESSFULLY!")
                 try:
                     exit_choice = input("\nUpload successful! Exit program? (y/n): ").strip().lower()
                     if exit_choice in ['y', 'yes']:
@@ -451,7 +535,6 @@ def upload_via_jump_server_continuous():
             print("The program will continue running...")
             time.sleep(2)
             continue
-    
     
     safe_disconnect()
     print("Program ended. All connections closed.")
